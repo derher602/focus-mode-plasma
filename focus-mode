@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# focus-mode — "extreme focus" for Fedora + KDE Plasma, driven by Plasma's native Do Not Disturb.
+#
+#   focus-mode watch           background watcher: native DND on  → focus on (asks lock time)
+#                                                  native DND off → focus off (refused while locked)
+#   focus-mode install         add the watcher to KDE autostart and start it
+#   focus-mode toggle          manual toggle (bind to a shortcut if you prefer)
+#   focus-mode on [minutes] | off | status
+#   focus-mode force-off       end focus mode even while locked (confirm + password)
+#   focus-mode list            show the blocked apps from the list file
+#   focus-mode dnd-state       debug: show what Plasma's DND setting looks like
+#
+# Needs a list file at /etc/focus-mode/config.yaml or config.json (see README.md).
+
+set -euo pipefail
+
+# ============================ CONFIG ============================
+# Blocked apps live in a root-owned list file (YAML or JSON), so it takes sudo
+# to change. See config.example.yaml / .json.
+CONFIG_DIR=/etc/focus-mode
+GUARD_INTERVAL=5       # seconds between app kills
+DEFAULT_LOCK_MIN=60     # pre-filled in the "lock for how long?" box (0 = no lock)
+POLL=2                  # seconds between DND checks in watch mode
+# ================================================================
+
+SELF="$(readlink -f "$0")"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/focus-mode"
+LOCK_FILE="$HOME/.local/state/focus-mode.lock"
+mkdir -p "$STATE_DIR" "$(dirname "$LOCK_FILE")"
+
+# ---------- list file (blocked apps) ----------
+config_file() {
+  local f
+  for f in "$CONFIG_DIR/config.yaml" "$CONFIG_DIR/config.yml" "$CONFIG_DIR/config.json"; do
+    [[ -r "$f" ]] && { echo "$f"; return 0; }
+  done
+  echo "No list file found in $CONFIG_DIR (see README: sudo install -Dm644 config.example.yaml $CONFIG_DIR/config.yaml)" >&2
+  return 1
+}
+
+# read_list <dotted.key> → prints one entry per line (missing key = empty list)
+read_list() {
+  local f; f=$(config_file) || return 1
+  python3 -I -c '
+import sys, json
+path, key = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as fh:
+        if path.endswith((".yaml", ".yml")):
+            try:
+                import yaml
+            except ImportError:
+                sys.exit("python3-pyyaml missing: sudo dnf install python3-pyyaml (or use config.json)")
+            data = yaml.safe_load(fh)
+        else:
+            data = json.load(fh)
+except OSError as e:
+    sys.exit(f"{path}: {e}")
+except ValueError as e:   # json.JSONDecodeError and yaml.YAMLError-ish
+    sys.exit(f"{path}: invalid syntax: {e}")
+except Exception as e:
+    sys.exit(f"{path}: {e}")
+node = data
+for k in key.split("."):
+    node = node.get(k) if isinstance(node, dict) else None
+if node is None:
+    node = []
+if not isinstance(node, list):
+    sys.exit(f"{path}: \"{key}\" must be a list")
+for item in node:
+    if item is not None and str(item).strip():
+        print(str(item).strip())
+' "$f" "$1"
+}
+
+# load_list <array name> <dotted.key>
+load_list() {
+  local -n _arr="$1"
+  local out
+  out=$(read_list "$2") || return 1
+  _arr=()
+  [[ -z "$out" ]] || mapfile -t _arr <<<"$out"
+}
+
+BLOCKED_PROCS=()
+BLOCKED_FLATPAKS=()
+load_config() {
+  load_list BLOCKED_PROCS blocked_apps.processes &&
+  load_list BLOCKED_FLATPAKS blocked_apps.flatpaks
+}
+
+cmd_list() {
+  local f x
+  f=$(config_file) || return 1
+  load_config || return 1
+  echo "List file: $f"
+  echo "Blocked processes:"; for x in "${BLOCKED_PROCS[@]}";    do echo "  $x"; done
+  echo "Blocked flatpaks:";  for x in "${BLOCKED_FLATPAKS[@]}"; do echo "  $x"; done
+}
+
+is_on() { [[ -f "$STATE_DIR/on" ]]; }
+have_tty() { [[ -t 0 ]]; }   # stdin only: stdout is a pipe inside $(...)
+
+msg() {
+  if have_tty; then echo "$*"
+  elif command -v kdialog >/dev/null; then kdialog --title "Focus mode" --msgbox "$*" &
+  else echo "$*" >&2
+  fi
+}
+
+ask_minutes() {
+  local m
+  if have_tty; then
+    read -rp "Lock focus for how many minutes? (0 = no lock) [$DEFAULT_LOCK_MIN]: " m || return 1
+    m="${m:-$DEFAULT_LOCK_MIN}"
+  else
+    command -v kdialog >/dev/null || { echo "kdialog missing: sudo dnf install kdialog" >&2; return 1; }
+    m=$(kdialog --title "Focus mode" --inputbox "Lock focus mode for how many minutes?
+(0 = can turn off anytime)" "$DEFAULT_LOCK_MIN") || return 1
+  fi
+  [[ "$m" =~ ^[0-9]+$ ]] || return 1
+  echo "$m"
+}
+
+# Yes/no question. $1 = text, $2 = continue label, $3 = cancel label. kind: warning
+confirm() {
+  local text="$1" yes="${2:-Continue}" no="${3:-Cancel}" a
+  if have_tty; then
+    printf '%s\n' "$text" >&2
+    read -rp "$yes? [y/N]: " a || return 1
+    [[ "$a" =~ ^[YySs]$ ]]
+  else
+    command -v kdialog >/dev/null || { echo "kdialog missing: sudo dnf install kdialog" >&2; return 1; }
+    kdialog --title "Focus mode" --warningyesno "$text" --yes-label "$yes" --no-label "$no"
+  fi
+}
+
+warn_before_on() {
+  confirm "
+Focus Mode allows you to be as productive as possible by blocking certain apps/functions:
+
+• Apps: Apps that are distractions (eg, Discord, Steam, Lutris, etc...) Will automatically close.
+• Notifications: fully muted.
+• If you set a lock, focus mode can't be turned off until it expires
+  (only with force-off, which needs your password).
+
+Turn focus mode on?" "Enable focus" "Cancel"
+}
+
+# Password check as a speed bump before force-off (KDE password dialog; non-zero if cancelled).
+ask_password() { pkexec /usr/bin/true; }
+
+# ---------- native Plasma DND state ----------
+# Plasma stores manual DND as [DoNotDisturb] Until=<datetime> in plasmanotifyrc.
+dnd_raw() { kreadconfig6 --file plasmanotifyrc --group DoNotDisturb --key Until 2>/dev/null || true; }
+
+native_dnd_on() {
+  local raw y mo d h mi s until
+  raw="$(dnd_raw)"
+  [[ -n "$raw" ]] || return 1
+  IFS=, read -r y mo d h mi s <<<"$raw"
+  s="${s%%.*}"
+  until=$(date -d "$y-$mo-$d $h:$mi:${s:-0}" +%s 2>/dev/null) || return 1
+  (( until > $(date +%s) ))
+}
+
+# ---------- notification hold (keeps things muted even if native DND gets switched off) ----------
+start_hold() {
+  if command -v kde-inhibit >/dev/null && kde-inhibit --help 2>&1 | grep -q -- '--notifications'; then
+    setsid kde-inhibit --notifications sleep infinity &
+  else
+    setsid python3 -c '
+import signal
+try:
+    import dbus
+    bus = dbus.SessionBus()
+    n = dbus.Interface(bus.get_object("org.freedesktop.Notifications", "/org/freedesktop/Notifications"),
+                       "org.freedesktop.Notifications")
+    n.Inhibit("focus-mode", "Extreme focus mode", dbus.Dictionary({}, signature="sv"))
+except ImportError:
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    bus.call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                  "org.freedesktop.Notifications", "Inhibit",
+                  GLib.Variant("(ssa{sv})", ("focus-mode", "Extreme focus mode", {})),
+                  None, Gio.DBusCallFlags.NONE, -1, None)
+signal.pause()
+' &
+  fi
+  echo $! > "$STATE_DIR/hold.pid"
+}
+
+stop_hold() {
+  if [[ -f "$STATE_DIR/hold.pid" ]]; then
+    local pid; pid=$(cat "$STATE_DIR/hold.pid")
+    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  fi
+  pkill -f 'kde-inhibit --notifications sleep infinity' 2>/dev/null || true
+  rm -f "$STATE_DIR/hold.pid"
+}
+
+# ---------- app guard ----------
+kill_blocked() {
+  local p id
+  for p in "${BLOCKED_PROCS[@]}"; do pkill -i -x "$p" 2>/dev/null || true; done
+  if command -v flatpak >/dev/null; then
+    for id in "${BLOCKED_FLATPAKS[@]}"; do flatpak kill "$id" 2>/dev/null || true; done
+  fi
+}
+start_guard() {
+  ( while true; do kill_blocked; sleep "$GUARD_INTERVAL"; done ) &
+  echo $! > "$STATE_DIR/guard.pid"
+}
+stop_guard() {
+  [[ -f "$STATE_DIR/guard.pid" ]] && kill "$(cat "$STATE_DIR/guard.pid")" 2>/dev/null || true
+  rm -f "$STATE_DIR/guard.pid"
+}
+
+lock_remaining() {  # prints seconds left (0 if unlocked)
+  local end now
+  [[ -f "$LOCK_FILE" ]] || { echo 0; return; }
+  end=$(cat "$LOCK_FILE"); now=$(date +%s)
+  (( end > now )) && echo $(( end - now )) || echo 0
+}
+
+# ---------- commands ----------
+cmd_on() {
+  local minutes="${1:-0}"
+  is_on && { msg "Focus mode is already on."; return 0; }
+  if ! load_config 2>"$STATE_DIR/config.err"; then
+    msg "Focus mode not enabled — problem with the list file:
+$(cat "$STATE_DIR/config.err")"
+    return 1
+  fi
+  start_hold
+  kill_blocked
+  start_guard
+  touch "$STATE_DIR/on"
+  if (( minutes > 0 )); then
+    echo $(( $(date +%s) + minutes * 60 )) > "$LOCK_FILE"
+    msg "🔒 Focus mode ON — locked until $(date -d "@$(cat "$LOCK_FILE")" +%H:%M).
+Remember to also toggle focus on other devices!"
+  else
+    rm -f "$LOCK_FILE"
+    msg "🔒 Focus mode ON. Remember to also toggle focus on other devices!"
+  fi
+}
+
+cmd_off() {   # returns 3 if locked
+  is_on || return 0
+  local left; left=$(lock_remaining)
+  if (( left > 0 )); then
+    return 3
+  fi
+  stop_guard
+  stop_hold
+  rm -f "$STATE_DIR/on" "$LOCK_FILE"
+  msg "🔓 Focus mode OFF."
+}
+
+cmd_toggle() {
+  if is_on; then
+    local rc=0; cmd_off || rc=$?
+    (( rc == 3 )) && msg "Still locked until $(date -d "@$(cat "$LOCK_FILE")" +%H:%M). Back to work."
+    return 0
+  fi
+  warn_before_on || return 0
+  local m; m=$(ask_minutes) || return 0
+  cmd_on "$m"
+}
+
+cmd_force_off() {
+  is_on || { msg "Focus mode is not on."; return 0; }
+  local left until_txt=""
+  left=$(lock_remaining)
+  (( left > 0 )) && until_txt=" It is locked for $(( (left + 59) / 60 )) more min."
+  confirm "Force focus mode OFF?$until_txt
+
+This ends the lock early, restores all apps,
+and unmutes notifications. You'll be asked for your password." "Force off" "Keep focusing" || return 0
+  ask_password || { msg "Focus mode stays ON (no password given)."; return 1; }
+  stop_guard
+  stop_hold
+  rm -f "$STATE_DIR/on" "$LOCK_FILE"
+  msg "🔓 Focus mode force-disabled."
+}
+
+locked_dialog() {
+  local t; t=$(date -d "@$(cat "$LOCK_FILE")" +%H:%M)
+  command -v kdialog >/dev/null || return 0
+  if ! kdialog --title "Focus mode" --warningyesno "Locked until $t.
+Apps stay blocked and notifications stay muted until then.
+Focus mode ends by itself once the lock expires." \
+      --yes-label "Keep focusing" --no-label "Force off…"; then
+    "$SELF" force-off </dev/null
+  fi
+}
+
+WATCH_PID="$STATE_DIR/watch.pid"
+WATCH_LOG="$STATE_DIR/watch.log"
+log() { echo "$(date +%T) $*" >> "$WATCH_LOG"; }
+
+watcher_running() {
+  local pid
+  [[ -f "$WATCH_PID" ]] || return 1
+  pid=$(cat "$WATCH_PID")
+  [[ -r "/proc/$pid/cmdline" ]] && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q 'focus-mode watch'
+}
+
+stop_watcher() {
+  if watcher_running; then kill "$(cat "$WATCH_PID")" 2>/dev/null || true; fi
+  rm -f "$WATCH_PID"
+}
+
+cmd_watch() {
+  if watcher_running && [[ "$(cat "$WATCH_PID")" != "$$" ]]; then
+    echo "watcher already running (pid $(cat "$WATCH_PID"))"; exit 0
+  fi
+  echo $$ > "$WATCH_PID"
+
+  local prev cur pending_off=0 rc m
+  native_dnd_on && prev=1 || prev=0
+  log "watcher started (pid $$), DND=$prev, raw='$(dnd_raw)'"
+
+  while sleep "$POLL"; do
+    native_dnd_on && cur=1 || cur=0
+
+    if (( cur != prev )); then
+      log "DND $prev -> $cur (raw='$(dnd_raw)'), focus=$(is_on && echo on || echo off)"
+      if (( cur == 1 )); then
+        pending_off=0
+        if ! is_on; then
+          { warn_before_on && m=$(ask_minutes) && cmd_on "$m"; } || true
+        fi
+      else
+        if is_on; then
+          rc=0; cmd_off || rc=$?
+          if (( rc == 3 )); then
+            pending_off=1
+            locked_dialog &
+          fi
+        fi
+      fi
+      prev=$cur
+    fi
+
+    # Lock expired while DND was already switched off → finish turning off (one prompt)
+    if (( pending_off == 1 )) && is_on && (( $(lock_remaining) == 0 )); then
+      pending_off=0
+      cmd_off || true
+    fi
+  done
+}
+
+cmd_install() {
+  mkdir -p "$HOME/.config/autostart"
+  cat > "$HOME/.config/autostart/focus-mode-watch.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Focus mode watcher
+Exec=$SELF watch
+X-KDE-autostart-phase=2
+NoDisplay=true
+EOF
+  stop_watcher
+  pkill -f -- '--notifications sleep infinity' 2>/dev/null || true   # leftovers from old versions
+  is_on || stop_guard
+  setsid "$SELF" watch </dev/null >>"$WATCH_LOG" 2>&1 &
+  sleep 1
+  if watcher_running; then echo "Watcher installed in autostart and running (pid $(cat "$WATCH_PID"))."
+  else echo "Watcher failed to start — see $WATCH_LOG"; fi
+}
+
+cmd_status() {
+  is_on && echo "Focus mode: ON" || echo "Focus mode: OFF"
+  local left; left=$(lock_remaining)
+  (( left > 0 )) && echo "Locked until: $(date -d "@$(cat "$LOCK_FILE")" +%H:%M)"
+  native_dnd_on && echo "Native DND: on" || echo "Native DND: off"
+  watcher_running && echo "Watcher: running (pid $(cat "$WATCH_PID"))" || echo "Watcher: NOT running"
+  echo "Log: $WATCH_LOG"
+}
+
+case "${1:-}" in
+  on)        cmd_on "${2:-0}" ;;
+  off)       rc=0; cmd_off || rc=$?; (( rc == 3 )) && echo "Still locked until $(date -d "@$(cat "$LOCK_FILE")" +%H:%M). (Use 'focus-mode force-off' to override.)"; exit $rc ;;
+  force-off) cmd_force_off ;;
+  toggle)    cmd_toggle ;;
+  watch)     cmd_watch ;;
+  install)   cmd_install ;;
+  status)    cmd_status ;;
+  list)      cmd_list ;;
+  dnd-state) echo "raw Until value: '$(dnd_raw)'"; native_dnd_on && echo "→ DND ON" || echo "→ DND OFF" ;;
+  *) echo "usage: focus-mode watch|install|toggle|on [min]|off|force-off|status|list|dnd-state"; exit 2 ;;
+esac

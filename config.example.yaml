@@ -1,0 +1,18 @@
+# focus-mode list file. Install it root-owned:
+#   sudo install -Dm644 -o root -g root config.example.yaml /etc/focus-mode/config.yaml
+
+blocked_apps:
+  # Process names, killed with `pkill -i -x` (case-insensitive, exact name).
+  # Find a name with:  ps -eo comm | sort -u | grep -i <app>
+  processes:
+    - discord
+    - DiscordCanary
+    - steam
+    - spotify
+
+  # Flatpak app IDs, killed with `flatpak kill`. Find IDs with:  flatpak list --app
+  flatpaks:
+    - com.discordapp.Discord
+    - com.valvesoftware.Steam
+    - com.spotify.Client
+    - dev.vencord.Vesktop
