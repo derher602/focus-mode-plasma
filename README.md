@@ -9,7 +9,7 @@ Turn on Plasma's native **Do Not Disturb** and focus mode kicks in:
 
 ## Requirements
 
-- Fedora (or another distro) running **KDE Plasma 6**
+- Distros running **KDE Plasma 6**
 - `bash` 4.4+, `python3`
 - `kdialog`: popups when there's no terminal
 - `kreadconfig6`: reads Plasma's DND state (ships with Plasma)
@@ -18,12 +18,18 @@ Turn on Plasma's native **Do Not Disturb** and focus mode kicks in:
 - Optional: `flatpak` (to kill Flatpak apps), `kde-inhibit` (otherwise falls back to `python3-dbus` or PyGObject for muting)
 
 ```sh
-sudo dnf install kdialog python3-pyyaml polkit
+sudo dnf install kdialog python3-pyyaml polkit # For Fedora-based systems, other distros, YMMV
 ```
 
 ## Install
 
+> [!WARNING]  
+> This script requires **ROOT**, This code has been tested (i know right) and works correctly (nor do i have the need for your sensitive info). I'm not liable for system destruction, always be careful when running things as root.
+
 ```sh
+
+git clone https://github.com/derher602/focus-mode-plasma.git # Clone the repo
+
 # 1. The list file (blocked apps). Root-owned so changing it needs sudo.
 sudo install -Dm644 -o root -g root config.example.yaml /etc/focus-mode/config.yaml
 #    …or the JSON version:
@@ -65,7 +71,7 @@ The same thing in JSON:
 - **Flatpak IDs**: `flatpak list --app`.
 - A section you leave out counts as an empty list.
 
-To edit it: `sudoedit /etc/focus-mode/config.yaml`. To check what focus mode will use: `focus-mode list`.
+To edit it: `sudo nano /etc/focus-mode/config.yaml`. To check what focus mode will use: `focus-mode list`.
 Changes take effect the **next time** focus mode is turned on.
 
 ## Usage
@@ -86,14 +92,3 @@ The normal flow: toggle **Do Not Disturb** in Plasma's notification tray. When D
 
 Other settings (`GUARD_INTERVAL`, `DEFAULT_LOCK_MIN`, `POLL`) are at the top of `focus-mode`.
 The watcher logs to `$XDG_RUNTIME_DIR/focus-mode/watch.log`.
-
-## Upgrading from the version with website blocking
-
-Older versions wrote browser policies through a root helper. Clean those up once:
-
-```sh
-sudo /usr/local/bin/focus-mode-root remove   # deletes the Firefox/Chrome/Chromium/Brave policies
-sudo rm /usr/local/bin/focus-mode-root
-```
-
-If you already have an `allowed_sites` section in your list file, it's ignored, so you can delete it.
