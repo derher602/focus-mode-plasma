@@ -10,13 +10,13 @@
 #   focus-mode list            show the blocked apps from the list file
 #   focus-mode dnd-state       debug: show what Plasma's DND setting looks like
 #
-# Needs a list file at /etc/focus-mode/config.yaml or config.json (see README.md).
+# Needs a list file at /etc/focus-mode/config.yaml (see README.md).
 
 set -euo pipefail
 
 # ============================ CONFIG ============================
-# Blocked apps live in a root-owned list file (YAML or JSON), so it takes sudo
-# to change. See config.example.yaml / .json.
+# Blocked apps live in a root-owned YAML list file, so it takes sudo
+# to change. See config.example.yaml.
 CONFIG_DIR=/etc/focus-mode
 GUARD_INTERVAL=5       # seconds between app kills
 DEFAULT_LOCK_MIN=60     # pre-filled in the "lock for how long?" box (0 = no lock)
@@ -31,10 +31,9 @@ mkdir -p "$STATE_DIR" "$(dirname "$LOCK_FILE")"
 # ---------- list file (blocked apps) ----------
 config_file() {
   local f
-  for f in "$CONFIG_DIR/config.yaml" "$CONFIG_DIR/config.yml" "$CONFIG_DIR/config.json"; do
-    [[ -r "$f" ]] && { echo "$f"; return 0; }
-  done
-  echo "No list file found in $CONFIG_DIR (see README: sudo install -Dm644 config.example.yaml $CONFIG_DIR/config.yaml)" >&2
+  f="$CONFIG_DIR/config.yaml"
+  [[ -r "$f" ]] && { echo "$f"; return 0; }
+  echo "No list file at $f (see README: sudo install -Dm644 config.example.yaml $f)" >&2
   return 1
 }
 
@@ -42,22 +41,19 @@ config_file() {
 read_list() {
   local f; f=$(config_file) || return 1
   python3 -I -c '
-import sys, json
+import sys
 path, key = sys.argv[1], sys.argv[2]
 try:
+    import yaml
+except ImportError:
+    sys.exit("python3-pyyaml missing: sudo dnf install python3-pyyaml")
+try:
     with open(path) as fh:
-        if path.endswith((".yaml", ".yml")):
-            try:
-                import yaml
-            except ImportError:
-                sys.exit("python3-pyyaml missing: sudo dnf install python3-pyyaml (or use config.json)")
-            data = yaml.safe_load(fh)
-        else:
-            data = json.load(fh)
+        data = yaml.safe_load(fh)
 except OSError as e:
     sys.exit(f"{path}: {e}")
-except ValueError as e:   # json.JSONDecodeError and yaml.YAMLError-ish
-    sys.exit(f"{path}: invalid syntax: {e}")
+except yaml.YAMLError as e:
+    sys.exit(f"{path}: invalid YAML: {e}")
 except Exception as e:
     sys.exit(f"{path}: {e}")
 node = data

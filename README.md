@@ -14,7 +14,7 @@ Turn on Plasma's native **Do Not Disturb** and focus mode kicks in:
 - `kdialog`: popups when there's no terminal
 - `kreadconfig6`: reads Plasma's DND state (ships with Plasma)
 - `pkexec` / polkit: password prompt for `force-off`
-- `python3-pyyaml`: only if you use a YAML list file (JSON needs nothing extra)
+- `python3-pyyaml`: reads the YAML list file
 - Optional: `flatpak` (to kill Flatpak apps), `kde-inhibit` (otherwise falls back to `python3-dbus` or PyGObject for muting)
 
 ```sh
@@ -32,8 +32,6 @@ git clone https://github.com/derher602/focus-mode-plasma.git # Clone the repo
 
 # 1. The list file (blocked apps). Root-owned so changing it needs sudo.
 sudo install -Dm644 -o root -g root config.example.yaml /etc/focus-mode/config.yaml
-#    …or the JSON version:
-# sudo install -Dm644 -o root -g root config.example.json /etc/focus-mode/config.json
 
 # 2. The script, somewhere on your PATH
 install -Dm755 focus-mode ~/.local/bin/focus-mode
@@ -44,7 +42,7 @@ focus-mode install
 
 ## The list file
 
-Blocked apps are kept in `/etc/focus-mode/config.yaml` (or `config.yml` / `config.json`; if several exist, YAML wins).
+Blocked apps are kept in `/etc/focus-mode/config.yaml`.
 It's root-owned on purpose: editing it needs `sudo`, so you can't quietly unblock an app in the middle of a focus session.
 
 ```yaml
@@ -54,17 +52,6 @@ blocked_apps:
     - steam
   flatpaks:           # killed with `flatpak kill`
     - com.discordapp.Discord
-```
-
-The same thing in JSON:
-
-```json
-{
-  "blocked_apps": {
-    "processes": ["discord", "steam"],
-    "flatpaks": ["com.discordapp.Discord"]
-  }
-}
 ```
 
 - **Process names**: run the app, then `ps -eo comm | sort -u | grep -i <app>`.
