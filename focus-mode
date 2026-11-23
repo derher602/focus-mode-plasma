@@ -6,6 +6,7 @@
 #   focus-mode install         add the watcher to KDE autostart and start it
 #   focus-mode toggle          manual toggle (bind to a shortcut if you prefer)
 #   focus-mode on [minutes] | off | status
+#   focus-mode pomodoro        start a locked pomodoro (POMODORO_MIN), then a break reminder
 #   focus-mode force-off       end focus mode even while locked (confirm + password)
 #   focus-mode list            show the blocked apps from the list file
 #   focus-mode dnd-state       debug: show what Plasma's DND setting looks like
@@ -21,6 +22,10 @@ CONFIG_DIR=/etc/focus-mode
 GUARD_INTERVAL=5       # seconds between app kills
 DEFAULT_LOCK_MIN=60     # pre-filled in the "lock for how long?" box (0 = no lock)
 POLL=2                  # seconds between DND checks in watch mode
+POMODORO_MIN=25         # length of one pomodoro (locked)
+BREAK_MIN=5             # short break after a pomodoro
+LONG_BREAK_MIN=15       # long break after every LONG_BREAK_EVERY pomodoros
+LONG_BREAK_EVERY=4
 # ================================================================
 
 SELF="$(readlink -f "$0")"
@@ -131,16 +136,54 @@ confirm() {
   fi
 }
 
-warn_before_on() {
-  confirm "
+WARN_TEXT="
 Focus Mode allows you to be as productive as possible by blocking certain apps/functions:
 
 • Apps: Apps that are distractions (eg, Discord, Steam, Lutris, etc...) Will automatically close.
 • Notifications: fully muted.
 • If you set a lock, focus mode can't be turned off until it expires
   (only with force-off, which needs your password).
+• When the time is up you'll get a reminder to take a break.
 
-Turn focus mode on?" "Enable focus" "Cancel"
+Pomodoro = ${POMODORO_MIN} min locked focus, then a ${BREAK_MIN} min break.
+How do you want to focus?"
+
+# Warning + session choice. Prints "pomodoro" or the lock length in minutes; non-zero if cancelled.
+ask_session() {
+  local a rc=0
+  if have_tty; then
+    printf '%s\n' "$WARN_TEXT" >&2
+    read -rp "[p] Pomodoro (${POMODORO_MIN} min) / [c] Custom time / [N] Cancel: " a || return 1
+    case "$a" in
+      [Pp]*)       echo pomodoro ;;
+      [CcYySs]*)   ask_minutes ;;
+      *)           return 1 ;;
+    esac
+  else
+    command -v kdialog >/dev/null || { echo "kdialog missing: sudo dnf install kdialog" >&2; return 1; }
+    kdialog --title "Focus mode" --warningyesnocancel "$WARN_TEXT" \
+      --yes-label "🍅 Pomodoro (${POMODORO_MIN} min)" --no-label "Custom time…" --cancel-label "Cancel" || rc=$?
+    case $rc in
+      0) echo pomodoro ;;
+      1) ask_minutes ;;
+      *) return 1 ;;
+    esac
+  fi
+}
+
+# start_session <"pomodoro"|minutes>
+start_session() {
+  if [[ "$1" == pomodoro ]]; then cmd_on "$POMODORO_MIN" pomodoro
+  else cmd_on "$1"
+  fi
+}
+
+# Desktop notification (+ sound if available). Only shown once the mute hold is gone,
+# except critical ones, which Plasma shows even in Do Not Disturb by default.
+notify() {  # notify <title> <body> [urgency]
+  command -v notify-send >/dev/null &&
+    notify-send -a "Focus mode" -i appointment-soon -u "${3:-normal}" "$1" "$2" 2>/dev/null || true
+  command -v canberra-gtk-play >/dev/null && { canberra-gtk-play -i complete >/dev/null 2>&1 & } || true
 }
 
 # Password check as a speed bump before force-off (KDE password dialog; non-zero if cancelled).
@@ -158,6 +201,12 @@ native_dnd_on() {
   s="${s%%.*}"
   until=$(date -d "$y-$mo-$d $h:$mi:${s:-0}" +%s 2>/dev/null) || return 1
   (( until > $(date +%s) ))
+}
+
+# Switch Plasma's DND off (so the break actually gets notifications back).
+clear_native_dnd() {
+  command -v kwriteconfig6 >/dev/null || return 0
+  kwriteconfig6 --file plasmanotifyrc --group DoNotDisturb --key Until --delete --notify 2>/dev/null || true
 }
 
 # ---------- notification hold (keeps things muted even if native DND gets switched off) ----------
@@ -219,10 +268,74 @@ lock_remaining() {  # prints seconds left (0 if unlocked)
   (( end > now )) && echo $(( end - now )) || echo 0
 }
 
+POMO_FILE="$STATE_DIR/pomodoro"          # exists while the current session is a pomodoro
+POMO_COUNT="$STATE_DIR/pomodoro.count"   # pomodoros done (for long breaks)
+BREAK_FILE="$STATE_DIR/break_until"      # epoch when the current break ends
+
+# Tear down focus without any message (shared by off / force-off / break).
+end_focus() {
+  stop_guard
+  stop_hold
+  rm -f "$STATE_DIR/on" "$LOCK_FILE" "$POMO_FILE"
+}
+
+# Start a break after a pomodoro; prints the break length in minutes.
+start_break() {
+  local n len
+  n=$(( $(cat "$POMO_COUNT" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$POMO_COUNT"
+  if (( n % LONG_BREAK_EVERY == 0 )); then len=$LONG_BREAK_MIN; else len=$BREAK_MIN; fi
+  echo $(( $(date +%s) + len * 60 )) > "$BREAK_FILE"
+  echo "$len"
+}
+
+# Focus time ran out. $1 = 1 to ask (break or keep focusing), 0 to just end (DND already off).
+time_up() {
+  local was_pomo=0 len
+  [[ -f "$POMO_FILE" ]] && was_pomo=1
+  if (( $1 == 1 )); then
+    notify "⏰ Time's up!" "Focus session finished. Time to take a break." critical
+    if ! confirm "⏰ Time's up!
+
+Your focus session is over. Take a break: stand up, stretch, drink some water.
+$( (( was_pomo )) && echo "
+Taking a break ends focus mode and switches Do Not Disturb off.")" "Take a break" "Keep focusing"; then
+      # Keep focusing: stay on, no lock, no longer a pomodoro
+      rm -f "$POMO_FILE"
+      log "time up: kept focusing"
+      return 0
+    fi
+    is_on || return 0   # turned off in the meantime
+    clear_native_dnd
+  fi
+  end_focus
+  log "time up: break (pomodoro=$was_pomo)"
+  if (( was_pomo )); then
+    len=$(start_break)
+    notify "☕ Break time" "Take ${len} minutes off. Back at $(date -d "@$(cat "$BREAK_FILE")" +%H:%M)."
+  else
+    notify "☕ Time for a break" "Focus mode is off. Nice work!"
+  fi
+}
+
+# Break ran out → offer the next pomodoro.
+break_over() {
+  notify "🍅 Break's over" "Ready for the next pomodoro?" critical
+  if confirm "🍅 Break's over!
+
+Start another ${POMODORO_MIN} min pomodoro?" "Start pomodoro" "Not now"; then
+    is_on || cmd_on "$POMODORO_MIN" pomodoro
+  else
+    rm -f "$POMO_COUNT"
+  fi
+}
+
 # ---------- commands ----------
-cmd_on() {
+cmd_on() {   # cmd_on <minutes> [pomodoro]
   local minutes="${1:-0}"
   is_on && { msg "Focus mode is already on."; return 0; }
+  [[ "$minutes" =~ ^[0-9]+$ ]] || { msg "Minutes must be a number."; return 1; }
+  rm -f "$BREAK_FILE"
   if ! load_config 2>"$STATE_DIR/config.err"; then
     msg "Focus mode not enabled — problem with the list file:
 $(cat "$STATE_DIR/config.err")"
@@ -232,7 +345,13 @@ $(cat "$STATE_DIR/config.err")"
   kill_blocked
   start_guard
   touch "$STATE_DIR/on"
-  if (( minutes > 0 )); then
+  if [[ "${2:-}" == pomodoro ]] && (( minutes > 0 )); then
+    touch "$POMO_FILE"
+    echo $(( $(date +%s) + minutes * 60 )) > "$LOCK_FILE"
+    msg "🍅 Pomodoro started — focus until $(date -d "@$(cat "$LOCK_FILE")" +%H:%M), then a break.
+Remember to also toggle focus on other devices!"
+  elif (( minutes > 0 )); then
+    rm -f "$POMO_FILE"
     echo $(( $(date +%s) + minutes * 60 )) > "$LOCK_FILE"
     msg "🔒 Focus mode ON — locked until $(date -d "@$(cat "$LOCK_FILE")" +%H:%M).
 Remember to also toggle focus on other devices!"
@@ -248,9 +367,7 @@ cmd_off() {   # returns 3 if locked
   if (( left > 0 )); then
     return 3
   fi
-  stop_guard
-  stop_hold
-  rm -f "$STATE_DIR/on" "$LOCK_FILE"
+  end_focus
   msg "🔓 Focus mode OFF."
 }
 
@@ -260,24 +377,21 @@ cmd_toggle() {
     (( rc == 3 )) && msg "Still locked until $(date -d "@$(cat "$LOCK_FILE")" +%H:%M). Back to work."
     return 0
   fi
-  warn_before_on || return 0
-  local m; m=$(ask_minutes) || return 0
-  cmd_on "$m"
+  local s; s=$(ask_session) || return 0
+  start_session "$s"
 }
 
-cmd_force_off() {
+cmd_force_off() {   # cmd_force_off [--confirmed]  (skip the yes/no when the caller already asked)
   is_on || { msg "Focus mode is not on."; return 0; }
   local left until_txt=""
   left=$(lock_remaining)
   (( left > 0 )) && until_txt=" It is locked for $(( (left + 59) / 60 )) more min."
-  confirm "Force focus mode OFF?$until_txt
+  [[ "${1:-}" == --confirmed ]] || confirm "Force focus mode OFF?$until_txt
 
 This ends the lock early, restores all apps,
 and unmutes notifications. You'll be asked for your password." "Force off" "Keep focusing" || return 0
   ask_password || { msg "Focus mode stays ON (no password given)."; return 1; }
-  stop_guard
-  stop_hold
-  rm -f "$STATE_DIR/on" "$LOCK_FILE"
+  end_focus
   msg "🔓 Focus mode force-disabled."
 }
 
@@ -286,9 +400,11 @@ locked_dialog() {
   command -v kdialog >/dev/null || return 0
   if ! kdialog --title "Focus mode" --warningyesno "Locked until $t.
 Apps stay blocked and notifications stay muted until then.
-Focus mode ends by itself once the lock expires." \
+Focus mode ends by itself once the lock expires.
+
+Force off ends it now (asks for your password)." \
       --yes-label "Keep focusing" --no-label "Force off…"; then
-    "$SELF" force-off </dev/null
+    "$SELF" force-off --confirmed </dev/null   # already confirmed here → straight to password
   fi
 }
 
@@ -326,7 +442,7 @@ cmd_watch() {
       if (( cur == 1 )); then
         pending_off=0
         if ! is_on; then
-          { warn_before_on && m=$(ask_minutes) && cmd_on "$m"; } || true
+          { m=$(ask_session) && start_session "$m"; } || true
         fi
       else
         if is_on; then
@@ -340,10 +456,25 @@ cmd_watch() {
       prev=$cur
     fi
 
-    # Lock expired while DND was already switched off → finish turning off (one prompt)
-    if (( pending_off == 1 )) && is_on && (( $(lock_remaining) == 0 )); then
-      pending_off=0
-      cmd_off || true
+    # Focus time ran out → time's up / take a break.
+    # The lock file is removed here so this fires once; time_up runs in the
+    # background so its dialog doesn't stall the watcher.
+    if is_on && [[ -f "$LOCK_FILE" ]] && (( $(lock_remaining) == 0 )); then
+      log "focus time up (DND=$cur, pending_off=$pending_off)"
+      rm -f "$LOCK_FILE"
+      if (( pending_off == 1 )); then
+        pending_off=0
+        time_up 0 || true          # DND already off: just end focus + notify
+      else
+        time_up 1 &               # ask: take a break or keep focusing
+      fi
+    fi
+
+    # Break ran out → offer the next pomodoro
+    if [[ -f "$BREAK_FILE" ]] && (( $(cat "$BREAK_FILE") <= $(date +%s) )); then
+      rm -f "$BREAK_FILE"
+      log "break over"
+      is_on || break_over &
     fi
   done
 }
@@ -371,6 +502,8 @@ cmd_status() {
   is_on && echo "Focus mode: ON" || echo "Focus mode: OFF"
   local left; left=$(lock_remaining)
   (( left > 0 )) && echo "Locked until: $(date -d "@$(cat "$LOCK_FILE")" +%H:%M)"
+  [[ -f "$POMO_FILE" ]] && echo "Session: pomodoro (#$(( $(cat "$POMO_COUNT" 2>/dev/null || echo 0) + 1 )))"
+  [[ -f "$BREAK_FILE" ]] && echo "On a break until: $(date -d "@$(cat "$BREAK_FILE")" +%H:%M)"
   native_dnd_on && echo "Native DND: on" || echo "Native DND: off"
   watcher_running && echo "Watcher: running (pid $(cat "$WATCH_PID"))" || echo "Watcher: NOT running"
   echo "Log: $WATCH_LOG"
@@ -378,13 +511,14 @@ cmd_status() {
 
 case "${1:-}" in
   on)        cmd_on "${2:-0}" ;;
+  pomodoro)  cmd_on "$POMODORO_MIN" pomodoro ;;
   off)       rc=0; cmd_off || rc=$?; (( rc == 3 )) && echo "Still locked until $(date -d "@$(cat "$LOCK_FILE")" +%H:%M). (Use 'focus-mode force-off' to override.)"; exit $rc ;;
-  force-off) cmd_force_off ;;
+  force-off) cmd_force_off "${2:-}" ;;
   toggle)    cmd_toggle ;;
   watch)     cmd_watch ;;
   install)   cmd_install ;;
   status)    cmd_status ;;
   list)      cmd_list ;;
   dnd-state) echo "raw Until value: '$(dnd_raw)'"; native_dnd_on && echo "→ DND ON" || echo "→ DND OFF" ;;
-  *) echo "usage: focus-mode watch|install|toggle|on [min]|off|force-off|status|list|dnd-state"; exit 2 ;;
+  *) echo "usage: focus-mode watch|install|toggle|on [min]|pomodoro|off|force-off|status|list|dnd-state"; exit 2 ;;
 esac

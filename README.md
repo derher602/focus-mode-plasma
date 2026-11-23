@@ -6,6 +6,8 @@ Turn on Plasma's native **Do Not Disturb** and focus mode kicks in:
 - **Apps**: distracting apps (Discord, Steam, Spotify, …) are killed every few seconds while focus is on.
 - **Notifications**: fully muted, even if DND gets switched back off.
 - **Lock**: optionally lock focus mode for N minutes. Until it runs out, focus can only be ended with `force-off` (confirmation + password).
+- **Break reminder**: when the time is up you get a notification + popup telling you to take a break (end focus) or keep going.
+- **Pomodoro**: one click for a locked 25 min session, then a 5 min break (15 min every 4th). When the break ends you're asked to start the next one.
 
 ## Requirements
 
@@ -15,7 +17,7 @@ Turn on Plasma's native **Do Not Disturb** and focus mode kicks in:
 - `kreadconfig6`: reads Plasma's DND state (ships with Plasma)
 - `pkexec` / polkit: password prompt for `force-off`
 - `python3-pyyaml`: reads the YAML list file
-- Optional: `flatpak` (to kill Flatpak apps), `kde-inhibit` (otherwise falls back to `python3-dbus` or PyGObject for muting)
+- Optional: `notify-send` (libnotify) for break notifications, `canberra-gtk-play` for a sound, `flatpak` (to kill Flatpak apps), `kde-inhibit` (otherwise falls back to `python3-dbus` or PyGObject for muting)
 
 ```sh
 sudo dnf install kdialog python3-pyyaml polkit # For Fedora-based systems, other distros, YMMV
@@ -63,7 +65,8 @@ Changes take effect the **next time** focus mode is turned on.
 
 ## Usage
 
-The normal flow: toggle **Do Not Disturb** in Plasma's notification tray. When DND turns on, the watcher shows a warning and asks how long to lock. When DND turns off, focus ends (unless it's locked; then it ends when the lock expires).
+The normal flow: toggle **Do Not Disturb** in Plasma's notification tray. When DND turns on, the watcher shows a warning and lets you pick **🍅 Pomodoro** or a **custom** lock time.
+When the time runs out you're told to take a break; taking it ends focus mode and switches DND off. When DND turns off, focus ends (unless it's locked; then it ends when the lock expires).
 
 | Command | What it does |
 |---|---|
@@ -71,11 +74,14 @@ The normal flow: toggle **Do Not Disturb** in Plasma's notification tray. When D
 | `focus-mode watch` | Run the DND watcher in the foreground (what autostart runs) |
 | `focus-mode toggle` | Manual on/off, handy to bind to a keyboard shortcut |
 | `focus-mode on [minutes]` | Turn on, optionally locked for N minutes |
+| `focus-mode pomodoro` | Start a locked pomodoro right away (no prompts) |
 | `focus-mode off` | Turn off (refused while locked) |
 | `focus-mode force-off` | Turn off even while locked (confirmation + password) |
 | `focus-mode status` | Show focus/lock/DND/watcher state |
 | `focus-mode list` | Show the blocked apps from the list file |
 | `focus-mode dnd-state` | Debug: show Plasma's raw DND value |
 
-Other settings (`GUARD_INTERVAL`, `DEFAULT_LOCK_MIN`, `POLL`) are at the top of `focus-mode`.
+Timers and breaks are run by the watcher, so it has to be running (`focus-mode status`).
+
+Other settings (`GUARD_INTERVAL`, `DEFAULT_LOCK_MIN`, `POLL`, `POMODORO_MIN`, `BREAK_MIN`, `LONG_BREAK_MIN`, `LONG_BREAK_EVERY`) are at the top of `focus-mode`.
 The watcher logs to `$XDG_RUNTIME_DIR/focus-mode/watch.log`.
